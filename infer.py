@@ -1,329 +1,203 @@
-"""
-Concurrent inference via SGLang.
+#!/usr/bin/env python3
+"""Step 1 of the evaluation: send documents to the SGLang server and save the raw outputs.
 
-Two input modes are supported:
-  1. Dataset images: pass --image_dir and each image is sent as one request.
-  2. PDF pages: pass --pdf and each converted page is sent as one request.
-"""
+Each document is a directory of ``page_<n>.(jpg|jpeg|png)`` images. The whole document goes
+out as one request: the images in page order, then ``"<PAGE><image>" * n_pages +
+"Multi page parsing."``. The raw output is written to ``<raw-dir>/<doc>.txt``. Run
+``utils/process_unlimitedOCR2.py`` on it to get markdown.
 
+Token budget (same as our evaluation setup):
+  * gundam mode (``crop_mode=True``) by default;
+  * if the benchmark ships a per-pdf token table (``<root>/<name>_per_pdf_{gundam,base}.jsonl``),
+    ``max_tokens = max_model_len - image_tokens - 700``. A multi-page document whose budget
+    is below its ground-truth length falls back to base mode;
+  * without the table, ``max_tokens = 0.3 * max_model_len``. If the server rejects the
+    request as too long, ``max_tokens`` is refit once from the prompt length the server
+    reports.
+
+Examples:
+  python infer.py --doc demo --out raw_demo.txt
+  python infer.py --benchmark MPDocBench --dataset-root /path/to/MPDocBench --all \\
+      --raw-dir raw --concurrency 4
+"""
 import argparse
 import base64
 import json
 import os
-import subprocess
-import sys
-import tempfile
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+from sglang.srt.sampling.custom_logit_processor import DeepseekOCRNoRepeatNGramLogitProcessor
 
-SERVED_MODEL_NAME = "Unlimited-OCR"
-SERVER_URL = "http://127.0.0.1:10000"
-HOST = "0.0.0.0"
-PORT = 10000
-SERVER_TIMEOUT = 300
-PDF_DPI = 300
-ATTENTION_BACKEND = "fa3"
-PAGE_SIZE = 1
-MEM_FRACTION_STATIC = 0.8
-PROMPT = "document parsing."
-TEMPERATURE = 0
-CONTEXT_LENGTH = 32768
-NO_REPEAT_NGRAM_SIZE = 35
-NGRAM_WINDOW = 128
-REQUEST_TIMEOUT = 1200
-MAX_RETRIES = 5
-NO_REPEAT_NGRAM_PROCESSOR_STR = None
+# max_model_len per benchmark; gen_reserve = 0.3 * max_model_len.
+BENCHMARKS = {'MPDocBench': 131072, 'MarathonDocBench': 786432}
+MODEL = 'Unlimited-OCR-2'
+PROMPT_MARGIN = 700
+NGRAM_SIZE = 35
+NGRAM_PROCESSOR = DeepseekOCRNoRepeatNGramLogitProcessor.to_str()
+RE_SGLANG_COUNTS = re.compile(
+    r'total of\s+(\d+)\s+tokens:\s*(\d+)\s+tokens from the input messages'
+    r'\s*and\s*(\d+)\s+tokens for the completion', re.I)
 
 
-def get_ngram_processor_str():
-    global NO_REPEAT_NGRAM_PROCESSOR_STR
-    if NO_REPEAT_NGRAM_PROCESSOR_STR is None:
-        from sglang.srt.sampling.custom_logit_processor import (
-            DeepseekOCRNoRepeatNGramLogitProcessor,
-        )
-        NO_REPEAT_NGRAM_PROCESSOR_STR = DeepseekOCRNoRepeatNGramLogitProcessor.to_str()
-    return NO_REPEAT_NGRAM_PROCESSOR_STR
+def list_pages(doc_dir, max_pages):
+    if not os.path.isdir(doc_dir):
+        raise SystemExit(f'doc dir not found: {doc_dir}')
+    files = [f for f in os.listdir(doc_dir) if re.match(r'page_\d+\.(jpg|jpeg|png)$', f, re.I)]
+    files.sort(key=lambda f: int(re.search(r'page_(\d+)', f).group(1)))
+    if max_pages:
+        files = files[:max_pages]
+    return os.path.basename(os.path.abspath(doc_dir)), [os.path.join(doc_dir, f) for f in files]
 
 
-def pdf_to_images(pdf_path: str, dpi: int = 300) -> list[str]:
-    import fitz
-
-    doc = fitz.open(pdf_path)
-    tmp_dir = tempfile.mkdtemp(prefix="pdf_ocr_")
-    image_paths = []
-    mat = fitz.Matrix(dpi / 72, dpi / 72)
-    for i, page in enumerate(doc):
-        out_path = os.path.join(tmp_dir, f"page_{i + 1:04d}.png")
-        page.get_pixmap(matrix=mat).save(out_path)
-        image_paths.append(out_path)
-    doc.close()
-    return image_paths
-
-
-def encode_image(image_path: str) -> dict:
-    ext = os.path.splitext(image_path)[1].lower()
-    mime = "image/jpeg" if ext in (".jpg", ".jpeg") else f"image/{ext.lstrip('.')}"
-    with open(image_path, "rb") as f:
-        data = base64.b64encode(f.read()).decode("utf-8")
-    return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}}
+def per_pdf_tokens(dataset_root, key, gundam):
+    """(image_tokens, gt_text_tokens) from the per-pdf table, or (None, None) if unavailable."""
+    if not dataset_root:
+        return None, None
+    name = os.path.basename(dataset_root.rstrip('/'))
+    path = os.path.join(dataset_root, f'{name}_per_pdf_{"gundam" if gundam else "base"}.jsonl')
+    if not os.path.exists(path):
+        return None, None
+    with open(path, encoding='utf-8') as f:
+        for line in f:
+            d = json.loads(line)
+            if os.path.basename(d.get('pdf', '')) == key:
+                return int(d['image_tokens']), int(d['text_tokens'])
+    return None, None
 
 
-def build_content(image_path: str) -> list[dict]:
-    return [{"type": "text", "text": PROMPT}, encode_image(image_path)]
+def plan(dataset_root, key, n_pages, max_model_len):
+    """Return (crop_mode, max_tokens)."""
+    gen_reserve = int(max_model_len * 0.3)
+    crop_mode = True
+    for _ in range(2):
+        img_tok, gt_tok = per_pdf_tokens(dataset_root, key, crop_mode)
+        if img_tok is None:  # not in the table: rely on the server-side refit
+            return crop_mode, gen_reserve
+        avail = max_model_len - img_tok - PROMPT_MARGIN
+        need = gt_tok + 1 if gt_tok is not None else gen_reserve
+        if avail < need and crop_mode and n_pages > 1:
+            print(f'[MODE] {key}: avail={avail} < need={need}, fall back to base')
+            crop_mode = False
+            continue
+        return crop_mode, max(1, avail)
+    return crop_mode, gen_reserve
 
 
-def server_ready(server_url: str) -> bool:
-    try:
-        resp = requests.get(f"{server_url}/health", timeout=5)
-        return resp.status_code == 200
-    except requests.RequestException:
-        return False
-
-
-def start_server(args):
-    if server_ready(SERVER_URL):
-        print(f"Reuse existing SGLang server: {SERVER_URL}")
-        return None
-
-    os.makedirs(os.path.dirname(os.path.abspath(args.server_log)) or ".", exist_ok=True)
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = args.gpu
-
-    cmd = [
-        sys.executable,
-        "-m",
-        "sglang.launch_server",
-        "--model",
-        args.model_dir,
-        "--served-model-name",
-        SERVED_MODEL_NAME,
-        "--attention-backend",
-        ATTENTION_BACKEND,
-        "--page-size",
-        str(PAGE_SIZE),
-        "--mem-fraction-static",
-        str(MEM_FRACTION_STATIC),
-        "--context-length",
-        str(CONTEXT_LENGTH),
-        "--enable-custom-logit-processor",
-        "--disable-overlap-schedule",
-        "--skip-server-warmup",
-        "--host",
-        HOST,
-        "--port",
-        str(PORT),
-    ]
-
-    print(f"Starting SGLang server on GPU {args.gpu}, port {PORT} ...")
-    log_file = open(args.server_log, "w", encoding="utf-8")
-    process = subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT)
-    process._log_file = log_file
-    print(f"Server PID: {process.pid}")
-
-    start = time.time()
-    while time.time() - start < SERVER_TIMEOUT:
-        if process.poll() is not None:
-            log_file.flush()
-            raise RuntimeError(f"SGLang server exited early. Check {args.server_log}")
-        if server_ready(SERVER_URL):
-            print(f"Server ready ({time.time() - start:.0f}s)")
-            return process
-        time.sleep(3)
-
-    stop_server(process)
-    raise TimeoutError(f"Timed out waiting for SGLang server. Check {args.server_log}")
-
-
-def stop_server(process):
-    if process is None:
-        return
-    process.terminate()
-    try:
-        process.wait(timeout=30)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
-    process._log_file.close()
-
-
-def collect_stream_silent(resp, output_file: str | None) -> dict:
-    chunks = []
-    token_count = 0
-    first_token_time = None
-    f = open(output_file, "w", encoding="utf-8") if output_file else None
-    try:
-        for raw_line in resp.iter_lines():
-            if not raw_line:
-                continue
-            line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
-            if not line.startswith("data:"):
-                continue
-            data = line[len("data:"):].strip()
-            if data == "[DONE]":
-                break
-            try:
-                chunk = json.loads(data)
-                delta = chunk["choices"][0]["delta"].get("content", "")
-            except (json.JSONDecodeError, KeyError):
-                continue
-            if not delta:
-                continue
-            if first_token_time is None:
-                first_token_time = time.time()
-            token_count += 1
-            chunks.append(delta)
-            if f:
-                f.write(delta)
-    finally:
-        if f:
-            f.close()
-
-    end_time = time.time()
-    decode_time = (end_time - first_token_time) if first_token_time and token_count > 1 else 0
-    return {"tokens": token_count, "decode_time": decode_time, "text": "".join(chunks)}
-
-
-def infer_one(image_path: str, output_file: str | None, args, idx: int) -> dict:
-    payload = {
-        "model": SERVED_MODEL_NAME,
-        "messages": [{"role": "user", "content": build_content(image_path)}],
-        "temperature": TEMPERATURE,
-        "skip_special_tokens": False,
-        "stream": True,
-        "images_config": {"image_mode": args.image_mode},
+def build_payload(pages, crop_mode, max_tokens):
+    content = []
+    for p in pages:
+        with open(p, 'rb') as fp:
+            b64 = base64.b64encode(fp.read()).decode('utf-8')
+        content.append({'type': 'image_url', 'image_url': {'url': f'data:image/jpeg;base64,{b64}'}})
+    content.append({'type': 'text', 'text': '<PAGE><image>' * len(pages) + 'Multi page parsing.'})
+    window = 1024 if len(pages) > 1 else 128
+    return {
+        'model': MODEL,
+        'messages': [{'role': 'user', 'content': content}],
+        'max_tokens': max_tokens,
+        'temperature': 0.0,
+        'skip_special_tokens': False,
+        'images_config': {'crop_mode': crop_mode},  # True = gundam (tiles), False = base
+        'custom_logit_processor': NGRAM_PROCESSOR,
+        'custom_params': {'ngram_size': NGRAM_SIZE, 'window_size': window},
     }
-    if NO_REPEAT_NGRAM_SIZE > 0 and NGRAM_WINDOW > 0:
-        payload["custom_logit_processor"] = get_ngram_processor_str()
-        payload["custom_params"] = {
-            "ngram_size": NO_REPEAT_NGRAM_SIZE,
-            "window_size": NGRAM_WINDOW,
-        }
 
-    name = os.path.basename(image_path)
-    for attempt in range(MAX_RETRIES):
-        try:
-            resp = requests.post(
-                f"{SERVER_URL}/v1/chat/completions",
-                headers={"Content-Type": "application/json"},
-                data=json.dumps(payload),
-                timeout=REQUEST_TIMEOUT,
-                stream=True,
-            )
-            if resp.status_code == 502 and attempt < MAX_RETRIES - 1:
-                time.sleep(3 * (attempt + 1))
+
+def request_one(url, doc_dir, args):
+    """Request one document; returns (stats, raw_answer). Raises SystemExit on failure."""
+    key, pages = list_pages(doc_dir, args.max_pages)
+    crop_mode, max_tokens = plan(args.dataset_root, key, len(pages), args.max_model_len)
+    payload = build_payload(pages, crop_mode, max_tokens)
+    for attempt in range(2):
+        t0 = time.time()
+        resp = requests.post(url, json=payload, timeout=args.timeout,
+                             headers={'Content-Type': 'application/json'})
+        if resp.status_code != 200:
+            body = resp.text[:1000]
+            m = RE_SGLANG_COUNTS.search(body)
+            if m and attempt == 0:  # too long: refit from the real prompt length once
+                payload['max_tokens'] = max(1, args.max_model_len - int(m.group(2)) - 64)
+                print(f"[REFIT] {key}: input={m.group(2)} -> max_tokens={payload['max_tokens']}")
                 continue
-            resp.raise_for_status()
-            result = collect_stream_silent(resp, output_file)
-            print(f"  [{idx}] {name}: {result['tokens']} tokens, {result['decode_time']:.1f}s")
-            return result
-        except Exception as e:
-            if attempt < MAX_RETRIES - 1:
-                print(f"  [{idx}] {name}: retry {attempt + 1}/{MAX_RETRIES} ({e})")
-                time.sleep(3 * (attempt + 1))
-                continue
-            print(f"  [{idx}] {name}: FAILED ({e})")
-            return {"tokens": 0, "decode_time": 0, "text": ""}
-
-
-def collect_dataset_images(image_dir: str) -> list[str]:
-    exts = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
-    image_files = []
-    for root, _, files in os.walk(image_dir):
-        for name in files:
-            if name.lower().endswith(exts):
-                image_files.append(os.path.join(root, name))
-    return sorted(image_files, key=lambda f: os.path.getsize(f), reverse=True)
-
-
-def build_jobs(args) -> list[tuple[str, str | None]]:
-    if args.pdf:
-        image_files = pdf_to_images(args.pdf, dpi=PDF_DPI)
-        prefix = os.path.splitext(os.path.basename(args.pdf))[0]
-        jobs = []
-        for i, image_path in enumerate(image_files):
-            output_file = None
-            if args.output_dir:
-                output_file = os.path.join(args.output_dir, f"{prefix}_page_{i + 1:04d}.md")
-            jobs.append((image_path, output_file))
-        return jobs
-
-    if not args.image_dir:
-        raise ValueError("Either --image_dir or --pdf is required")
-    image_files = collect_dataset_images(args.image_dir)
-
-    jobs = []
-    for image_path in image_files:
-        output_file = None
-        if args.output_dir:
-            rel = os.path.relpath(image_path, args.image_dir)
-            stem = os.path.splitext(rel)[0].replace(os.sep, "__")
-            output_file = os.path.join(args.output_dir, f"{stem}.md")
-        jobs.append((image_path, output_file))
-    return jobs
-
-
-def run(args):
-    jobs = build_jobs(args)
-    if args.output_dir:
-        os.makedirs(args.output_dir, exist_ok=True)
-
-    mode = "pdf_pages" if args.pdf else "dataset_images"
-    print(f"Mode: {mode}, requests={len(jobs)}, concurrency={args.concurrency}, image_mode={args.image_mode}")
-
-    wall_start = time.time()
-    results = []
-    with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
-        futures = {
-            executor.submit(infer_one, image_path, output_file, args, i + 1): image_path
-            for i, (image_path, output_file) in enumerate(jobs)
-        }
-        for future in as_completed(futures):
-            results.append(future.result())
-
-    wall_time = time.time() - wall_start
-    total_tokens = sum(r["tokens"] for r in results)
-    successful = sum(1 for r in results if r["tokens"] > 0)
-    print(f"\n{'=' * 60}")
-    print("Concurrent Results:")
-    print(f"  Requests: {successful}/{len(jobs)}")
-    print(f"  Total tokens: {total_tokens}")
-    print(f"  Wall time: {wall_time:.2f}s")
-    if wall_time > 0:
-        print(f"  System TPS: {total_tokens / wall_time:.2f} tokens/s")
-    if successful > 0:
-        avg_decode = sum(r["decode_time"] for r in results if r["tokens"] > 0) / successful
-        avg_tokens = total_tokens / successful
-        print(f"  Avg tokens/request: {avg_tokens:.0f}")
-        print(f"  Avg decode_time/request: {avg_decode:.2f}s")
-    print(f"{'=' * 60}")
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="SGLang concurrent inference for image datasets or PDF pages.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument("--image_dir", default="", help="Directory of images for dataset concurrency mode")
-    parser.add_argument("--pdf", default="", help="PDF file; each page is converted and sent as one concurrent request")
-    parser.add_argument("--output_dir", default="./outputs")
-    parser.add_argument("--concurrency", type=int, default=8)
-    parser.add_argument("--gpu", default="0")
-    parser.add_argument("--model_dir", default="baidu/Unlimited-OCR")
-    parser.add_argument("--image_mode", choices=("gundam", "base"), default="gundam")
-    parser.add_argument("--server_log", default="./log/sglang_server.log")
-    return parser.parse_args()
+            raise SystemExit(f'HTTP {resp.status_code} {body}')
+        data = resp.json()
+        choice = data['choices'][0]
+        answer = choice['message'].get('content') or ''
+        usage = data.get('usage') or {}
+        return {
+            'doc': key, 'pages': len(pages), 'crop_mode': crop_mode,
+            'max_tokens': payload['max_tokens'], 'finish_reason': choice.get('finish_reason'),
+            'prompt_tokens': usage.get('prompt_tokens'),
+            'completion_tokens': usage.get('completion_tokens'),
+            'page_markers': answer.count('<PAGE>'), 'seconds': round(time.time() - t0, 1),
+        }, answer
+    raise SystemExit(f'{key}: still failing after refit')
 
 
 def main():
-    args = parse_args()
-    server_process = start_server(args)
-    try:
-        run(args)
-    finally:
-        stop_server(server_process)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--url', default='127.0.0.1:10000', help='SGLang server host:port')
+    ap.add_argument('--benchmark', choices=list(BENCHMARKS), default='MPDocBench',
+                    help='sets max_model_len (MPDocBench=131072, MarathonDocBench=786432)')
+    ap.add_argument('--max-model-len', type=int, default=None, help='override max_model_len')
+    ap.add_argument('--dataset-root', default=None,
+                    help='benchmark root (<root>/images/<doc>/page_*.jpg + per-pdf token tables)')
+    ap.add_argument('--doc', default=None, help='a document directory, or a doc id under <root>/images')
+    ap.add_argument('--all', action='store_true', help='request every document under <root>/images')
+    ap.add_argument('--max-pages', type=int, default=0, help='only send the first N pages, 0 = all')
+    ap.add_argument('--concurrency', type=int, default=4)
+    ap.add_argument('--timeout', type=int, default=6000)
+    ap.add_argument('--raw-dir', default=None, help='write raw outputs to <raw-dir>/<doc>.txt')
+    ap.add_argument('--out', default=None, help='single document: write the raw output here')
+    args = ap.parse_args()
+
+    args.max_model_len = args.max_model_len or BENCHMARKS[args.benchmark]
+    images_root = os.path.join(args.dataset_root, 'images') if args.dataset_root else None
+    if args.all:
+        if not images_root or not args.raw_dir:
+            raise SystemExit('--all needs --dataset-root and --raw-dir')
+        docs = [os.path.join(images_root, d) for d in sorted(os.listdir(images_root))]
+    elif args.doc:
+        docs = [args.doc if os.path.isdir(args.doc) or not images_root
+                else os.path.join(images_root, args.doc)]
+    else:
+        raise SystemExit('give --doc or --all')
+    if args.raw_dir:
+        os.makedirs(args.raw_dir, exist_ok=True)
+    url = f"http://{args.url.replace('http://', '').rstrip('/')}/v1/chat/completions"
+    print(f'[CFG] url={url} max_model_len={args.max_model_len} docs={len(docs)}', flush=True)
+
+    def handle(doc_dir):
+        stats, answer = request_one(url, doc_dir, args)
+        if args.raw_dir:
+            with open(os.path.join(args.raw_dir, stats['doc'] + '.txt'), 'w', encoding='utf-8') as f:
+                f.write(answer)
+        return stats, answer
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=max(1, min(args.concurrency, len(docs)))) as ex:
+        futures = {ex.submit(handle, d): d for d in docs}
+        for fut in as_completed(futures):
+            done += 1
+            try:
+                stats, answer = fut.result()
+            except (Exception, SystemExit) as e:  # one failed document must not stop the run
+                print(json.dumps({'doc': futures[fut], 'error': str(e)[:300],
+                                  'progress': f'{done}/{len(docs)}'}, ensure_ascii=False))
+                continue
+            stats['progress'] = f'{done}/{len(docs)}'
+            print(json.dumps(stats, ensure_ascii=False), flush=True)
+            if len(docs) == 1 and not args.raw_dir:
+                if args.out:
+                    with open(args.out, 'w', encoding='utf-8') as f:
+                        f.write(answer)
+                    print('saved ->', args.out)
+                else:
+                    print(answer)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
