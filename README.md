@@ -6,7 +6,7 @@
 
 <hr>
 
-<h1 align="center">Unlimited OCR Works 2</h1>
+<h1 align="center">Unlimited OCR Works</h1>
 
 <div align="center">
 <a href="https://trendshift.io/repositories/62053?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-62053" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/62053/daily" alt="baidu%2FUnlimited-OCR | Trendshift" width="250" height="55"/></a>
@@ -16,12 +16,18 @@
   <a href="https://github.com/baidu/Unlimited-OCR">
     <img alt="GitHub" src="https://img.shields.io/badge/GitHub-Code-181717?logo=github&logoColor=white" />
   </a>
+  <a href="https://huggingface.co/baidu/Unlimited-OCR">
+    <img alt="Hugging Face" src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Unlimited--OCR-ffc107?color=ffc107&logoColor=white" />
+  </a>
   <a href="https://huggingface.co/baidu/Unlimited-OCR-2">
-    <img alt="Hugging Face" src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-ffc107?color=ffc107&logoColor=white" />
+    <img alt="Hugging Face" src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Unlimited--OCR--2-ffc107?color=ffc107&logoColor=white" />
   </a>
 </div>
 
 <div align="center">
+  <a href="https://arxiv.org/abs/2606.23050">
+    <img alt="arXiv" src="https://img.shields.io/badge/arXiv-Unlimited OCR Works-b31b1b?logo=arxiv&logoColor=white" />
+  </a>
     <a href="https://github.com/baidu/Unlimited-OCR/blob/Unlimited-OCR-2/Unlimited-OCR-2.pdf">
     <img alt="arXiv" src="https://img.shields.io/badge/arXiv-Unlimited OCR Works 2-b31b1b?logo=arxiv&logoColor=white" />
   </a>
@@ -34,13 +40,13 @@
 
 <div align="center">
 
-<img src="assets/Unlimited-OCR2.png" width="1000" alt="Unlimited OCR 2 overview" />
+<img src="assets/Unlimited-OCR2.png" width="600" alt="Unlimited OCR 2 overview" />
 
 </div>
 
 
 ## Release
-- [2026/10/27] 📊 We release [**MarathonDocBench**](https://huggingface.co/datasets/baidu/MarathonDocBench), a new benchmark for ultra-long document parsing
+- [2026/10/27] 📊 We release [**MarathonDocBench**](https://huggingface.co/datasets/baidu/MarathonDocBench), a new benchmark for ultra-long document parsing.
 - [2026/10/27] 🤝 Thanks to the [ModelScope community](https://github.com/modelscope) for their support. Our model is now available at [ModelScope](https://modelscope.cn/models/PaddlePaddle/Unlimited-OCR-2).
 - [2026/10/27] 🤝 Thanks to the Baidu Cloud team for their support. Our model is now available on [Baidu Cloud](https://cloud.baidu.com/doc/OCR/s/fmr1p39gb).
 - [2026/10/27] 🤝 Thanks to [AK](https://x.com/_akhaliq) for creating a new demo for us. Try it at [Unlimited-OCR-2](https://huggingface.co/spaces/baidu/Unlimited-OCR-2).
