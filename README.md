@@ -46,6 +46,7 @@
 
 
 ## Release
+- [2026/10/28] Thanks to the [ms-swift community](https://github.com/modelscope/ms-swift) for supporting training of **Unlimited OCR 2**.
 - [2026/10/27] 📊 We release [**MarathonDocBench**](https://huggingface.co/datasets/baidu/MarathonDocBench), a new benchmark for ultra-long document parsing.
 - [2026/10/27] 🤝 Thanks to the [ModelScope community](https://github.com/modelscope) for their support. Our model is now available at [ModelScope](https://modelscope.cn/models/PaddlePaddle/Unlimited-OCR-2).
 - [2026/10/27] 🤝 Thanks to the Baidu Cloud team for their support. Our model is now available on [Baidu Cloud](https://cloud.baidu.com/doc/OCR/s/fmr1p39gb).
